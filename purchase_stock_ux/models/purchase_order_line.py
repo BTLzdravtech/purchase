@@ -59,17 +59,39 @@ class PurchaseOrderLine(models.Model):
         for line in lines:
             line.qty_on_voucher = sum(moves.filtered(lambda x: x.id in line.move_ids.ids).mapped("product_uom_qty"))
 
+    def unlink(self):
+        """Evitar el bloqueo al borrar líneas MTO cuya entrega ya se hizo.
+
+        El unlink estándar de ``purchase_stock`` cancela los ``move_dest_ids`` de
+        las líneas con ``propagate_cancel`` sin filtrar los movimientos ya
+        realizados. Si el destino -la entrega al cliente de una línea MTO- ya
+        está en estado ``done`` (porque se entregó desde stock disponible),
+        ``stock.move._action_cancel()`` lanza "No puede cancelar un movimiento de
+        existencias que se haya configurado como 'Hecho'" y bloquea el borrado.
+
+        ``purchase.order.button_cancel()`` ya contempla este caso filtrando los
+        movimientos ``state != 'done'`` antes de cancelar; replicamos esa misma
+        protección acá: desvinculamos los movimientos destino ya hechos para que
+        el borrado no intente cancelarlos. El movimiento entregado queda intacto.
+        """
+        for line in self:
+            done_dest_moves = line.move_dest_ids.filtered(lambda m: m.state == "done" and not m.scrapped)
+            if done_dest_moves:
+                line.move_dest_ids = [fields.Command.unlink(move.id) for move in done_dest_moves]
+        return super().unlink()
+
     def button_cancel_remaining(self):
         # la cancelación de kits no está bien resuelta ya que odoo
         # solo computa la cantidad entregada cuando todo el kit se entregó.
         # Cuestión que, por ahora, desactivamos la cancelación de kits.
-        if self.order_id.state == "done":
-            raise UserError(
-                _(
-                    "Cancel remaining quantities can't be called for blocked purchase orders. "
-                    "First unblock the purchase order"
-                )
-            )
+
+        # Manejar órdenes bloqueadas (done): desbloquear temporalmente sin tracking
+        orders_to_relock = self.env["purchase.order"]
+        for order in self.mapped("order_id").filtered(lambda o: o.state == "done"):
+            orders_to_relock |= order
+            # Desbloquear sin generar mensaje en el chatter
+            order.with_context(tracking_disable=True).write({"state": "purchase"})
+
         bom_enable = "bom_ids" in self.env["product.template"]._fields
         for rec in self:
             old_product_qty = rec.product_qty
@@ -99,10 +121,16 @@ class PurchaseOrderLine(models.Model):
             # la realidad es que probablemente esto de acá no sea necesario. modificar product_qty ya hace que odoo,
             # apartir de 16 al menos, baje las cantidades de los moves. Justamente por esta razon es que ahora
             # pasamos contexto arriba de "cancel_from_order", porque ahora es odoo quien cancela los pickings
+            if rec.product_qty < old_product_qty:
+                rec.order_id._log_decrease_ordered_quantity({rec: (rec.product_qty, old_product_qty)})
             rec.order_id.message_post(
                 body=_('Cancel remaining call for line "%s" (id %s), line qty updated from %s to %s')
                 % (rec.name, rec.id, old_product_qty, rec.product_qty)
             )
+
+        # Volver a bloquear las órdenes que estaban bloqueadas sin generar mensaje
+        if orders_to_relock:
+            orders_to_relock.with_context(tracking_disable=True).write({"state": "done"})
 
     def _compute_vouchers(self):
         # Cambiamos esta lógica ya que antes teníamos si o si voucher_ids por dependencias y ahora va a depender de que esté instalado stock_voucher
@@ -174,10 +202,12 @@ class PurchaseOrderLine(models.Model):
         for line in self:
             qty = 0.0
             for move in line.move_ids.filtered(
-                lambda m: m.state == "done"
-                and m.location_id.usage != "supplier"
-                and m.to_refund
-                and not m._is_exchange_move_helper()
+                lambda m: (
+                    m.state == "done"
+                    and m.location_id.usage != "supplier"
+                    and m.to_refund
+                    and not m._is_exchange_move_helper()
+                )
             ):
                 qty += move.product_uom._compute_quantity(move.product_uom_qty, line.product_uom)
             line.qty_returned = qty

@@ -40,6 +40,15 @@ class PurchaseOrderLine(models.Model):
         default=0.0,
     )
 
+    # Campo relacionado para poder usar aggregator en agrupaciones sin afectar el campo base
+    price_subtotal_aggregable = fields.Monetary(
+        related="price_subtotal",
+        string="Subtotal ",
+        aggregator="sum",
+        store=False,
+        readonly=True,
+    )
+
     @api.depends("order_id.state", "qty_invoiced", "product_qty", "qty_to_invoice", "order_id.force_invoiced_status")
     def _compute_invoice_status(self):
         precision = self.env["decimal.precision"].precision_get("Product Unit of Measure")
@@ -163,6 +172,17 @@ class PurchaseOrderLine(models.Model):
         """
         price_update_lines = self.filtered(lambda x: x.state not in ["purchase", "done"])
         res = super(PurchaseOrderLine, price_update_lines)._compute_price_unit_and_date_planned_and_name()
+
+        # Lines in confirmed/done POs without date_planned are new lines added after confirmation.
+        # Price and description must NOT be updated (rule a), but date_planned must be initialized.
+        for line in (self - price_update_lines).filtered(lambda x: not x.date_planned and x.product_id):
+            seller = line.product_id._select_seller(
+                partner_id=line.partner_id,
+                quantity=line.product_qty,
+                date=line.order_id.date_order and line.order_id.date_order.date() or fields.Date.context_today(line),
+                uom_id=line.product_uom,
+            )
+            line.date_planned = line._get_date_planned(seller)
 
         for line in price_update_lines.filtered(lambda x: x.product_id and not x.price_unit):
             price_unit = line.with_company(line.company_id.id).product_id.standard_price
